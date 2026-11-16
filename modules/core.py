@@ -336,7 +336,12 @@ def destroy(to_quit=True) -> None:
     if modules.globals.target_path:
         clean_temp(modules.globals.target_path)
     if to_quit:
-        quit()
+        # ui.quit_app() stops any running Live session (joining its
+        # capture/processing threads) before ending the app — required so
+        # Qt never has to destroy a still-running QThread, which aborts
+        # the process. Python's quit()/SystemExit did neither and could
+        # abort on Ctrl+C during a live session.
+        ui.quit_app()
 
 
 def run() -> None:

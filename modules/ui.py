@@ -227,6 +227,22 @@ WORKER_SHUTDOWN_GRACE_MS = 30000
 # async swap result. A short detector miss keeps it, so the swap resumes at
 # once instead of showing the real face for a whole inference.
 ASYNC_SWAP_FACE_LOSS_GRACE_S = 0.5
+# True while _on_live() is loading models / opening the camera, before
+# _WEBCAM_PREVIEW gets assigned and its threads start. update_status()
+# pumps the event loop (processEvents()) during that stretch so status
+# text stays live — which means a quit requested via Ctrl+C can get
+# processed in the middle of it. _do_quit() checks this flag so it
+# doesn't quit app.exec() before the about-to-start capture/processing
+# QThreads exist and have had their stop event set.
+_live_starting = False
+# True from the moment quit_app() is first called (e.g. the SIGINT
+# handler). Once set, nothing should start a new Live session —
+# _apply_cli_camera_args()'s auto-start and _on_live() both bail out
+# immediately when they see it, since the signal can arrive before
+# _on_live() has even been scheduled yet (e.g. during the heavy
+# torch/onnxruntime imports or partway through building MainWindow),
+# not just while it's running.
+_quit_requested = False
 _MAPPER: Optional["MapperDialog"] = None
 _LIVE_MAPPER: Optional["LiveMapperDialog"] = None
 _LANG: Optional[LanguageManager] = None
@@ -1064,6 +1080,12 @@ class MainWindow(QMainWindow):
             _PREVIEW.show()
 
     def _on_live(self) -> None:
+        if _quit_requested:
+            # A shutdown is already in progress (SIGINT fired before this
+            # got a chance to run, e.g. during the heavy imports or while
+            # MainWindow was still being built) — don't start a new
+            # session the app is about to tear down anyway.
+            return
         idx = self.cb_camera.currentIndex()
         if idx < 0 or idx >= len(self._camera_indices):
             update_status("No camera available")
@@ -1077,11 +1099,16 @@ class MainWindow(QMainWindow):
             if modules.globals.source_path is None:
                 update_status("Please select a source image first")
                 return
-            from modules.face_analyser import get_face_analyser
-            from modules.processors.frame.face_swapper import get_face_swapper
-            get_face_analyser()
-            get_face_swapper()
-            _open_webcam_preview(camera_index)
+            global _live_starting
+            _live_starting = True
+            try:
+                from modules.face_analyser import get_face_analyser
+                from modules.processors.frame.face_swapper import get_face_swapper
+                get_face_analyser()
+                get_face_swapper()
+                _open_webcam_preview(camera_index)
+            finally:
+                _live_starting = False
         else:
             modules.globals.source_target_map = []
             _open_live_mapper_dialog(camera_index, modules.globals.source_target_map)
@@ -1489,6 +1516,63 @@ def _open_webcam_preview(camera_index: int) -> None:
         _WEBCAM_PREVIEW.close()
     _WEBCAM_PREVIEW = WebcamPreviewWindow(camera_index)
     _WEBCAM_PREVIEW.show()
+
+
+def _do_quit() -> None:
+    if _live_starting:
+        # A Live session is actively loading models / opening the camera
+        # (update_status()'s processEvents() calls re-entered us mid-way
+        # through that). Quitting now would quit app.exec() before its
+        # capture/processing QThreads even exist, leaving the ones about
+        # to start a moment from now orphaned and running. Check back
+        # shortly instead.
+        QTimer.singleShot(50, _do_quit)
+        return
+    # _close_live_windows() (below) closes both _WEBCAM_PREVIEW and
+    # _LIVE_MAPPER, joining their capture/processing QThreads before
+    # returning — same helper MainWindow's own destroy path uses.
+    _close_live_windows()
+    if _APP is not None:
+        _APP.quit()
+
+
+def quit_app() -> None:
+    """Stop any running Live session, then end the app.
+
+    The SIGINT handler that calls this can fire at literally any point —
+    including partway through WebcamPreviewWindow's own startup (model
+    loading, opening the camera), which runs synchronously and takes
+    seconds. If the signal lands before that constructor has gotten as
+    far as registering the window and starting its capture/processing
+    QThreads, _close_live_windows() finds nothing to close yet, but
+    QApplication.quit() still takes effect once control returns to the
+    event loop — which happens *after* the interrupted constructor call
+    resumes and finishes starting those threads. They're then left
+    running with nothing having told them to stop, and Qt destroying a
+    QThread whose run() is still executing is fatal (aborts the
+    process). Deferring the real work via a 0ms QTimer instead runs it
+    once the current call stack has fully unwound back to the event
+    loop, so by then any in-progress window construction has completed
+    and there's nothing left in an inconsistent half-started state.
+
+    Uses QApplication.quit() rather than Python's quit()/SystemExit:
+    raised from a signal handler while app.exec() is running, SystemExit
+    isn't guaranteed to unwind the native Qt event loop the same way.
+    Falls back to a plain process exit when no QApplication was ever
+    created (true headless -t/-o batch mode never calls ui.init()).
+
+    Called directly from core.destroy() — i.e. also on the SIGINT path,
+    which _destroy_with_cleanup()'s synchronous _close_live_windows()
+    call (see init(), below) does not cover by itself, since the signal
+    handler calls core.destroy() directly rather than going through
+    MainWindow's wrapped _destroy_cb.
+    """
+    global _quit_requested
+    _quit_requested = True
+    if _APP is not None:
+        QTimer.singleShot(0, _do_quit)
+    else:
+        sys.exit(0)
 
 
 # ─── mapper dialogs (image/video + live) ────────────────────────────────
